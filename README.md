@@ -2,6 +2,13 @@
 
 This repository provides an inference pipeline for **ProteinMPNN extended to non-canonical amino acids (ncAAs)**.
 
+## environment:
+We recommend using Conda to manage dependencies.
+
+```bash
+conda env create -f environment.yml
+conda activate ncproteinmpnn
+```
 
 ## 0. Convert `.pdb` to `.mmcif`
 
