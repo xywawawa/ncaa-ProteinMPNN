@@ -366,6 +366,11 @@ def write_fasta(out_path, title, aa1_string, design_mask=None):
 
 def build_model_from_ckpt(args, vocab, device):
     """Rebuild model & tokenizer from saved args (with fallbacks)."""
+    def _arg_get(name, default=None):
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
     hidden_dim = int(args.get("hidden_dim", 128))
     num_encoder_layers = int(args.get("num_encoder_layers", 3))
     num_decoder_layers = int(args.get("num_decoder_layers", 3))
@@ -409,8 +414,8 @@ def build_model_from_ckpt(args, vocab, device):
         return torch.from_numpy(W)
 
     def load_zmap_from_all(
-        cls_path=args.chem_embedding_cls_path,
-        meta_path=args.chem_embedding_meta_path
+        cls_path=None,
+        meta_path=None
     ):
         """
         Load merged CLS embeddings (20AA + CSV ncAA), keep only allowed residues (20AA + specified ncAA).
@@ -418,18 +423,17 @@ def build_model_from_ckpt(args, vocab, device):
         """
         import torch, json, numpy as np
         allowed = {
-            # canonical 20
-            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS",
+            # canonical 20, remove GLY
+            "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "HIS",
             "ILE", "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP",
             "TYR", "VAL",
             # ncAA 
-            "4BF", "MLE", "TPO", "HYP", "SCY", "CGU", "ABA", "MLY", "CXM", "PCA",
-            "CSX", "HIC", "SAR", "MLZ", "SCH", "ALY", "CSD", "CSS", "CSO", "ORN",
-            "FME", "CME", "KCX", "M3L", "AIB", "XCP", "MVA", "YCM", "DHA", "NLE", "OCS",
-            "DAL","DAR","DAS","DCY","DGL","DGN",
-            "DHI","DIL","DLE","DLY","DPN","DPR",
-            "DSN","DTH","DTR","DTY","DVA"
+            "CRO", "GYS", "FTR", "CR2", "HIC", "MHS", "3FG", "NLE", "PIA",
+            "HYP", "ABA", "AIB", "NEP", "SAR",
         }
+        cls_path = cls_path or _arg_get("chem_embedding_cls_path", "unimol_cls_all_chiral.pt")
+        meta_path = meta_path or _arg_get("chem_embedding_meta_path", "unimol_cls_all_chiral_meta.json")
+
         cls = torch.load(cls_path, map_location="cpu")
         if isinstance(cls, torch.Tensor):
             cls = cls.detach().cpu().numpy()
@@ -451,8 +455,11 @@ def build_model_from_ckpt(args, vocab, device):
         print(f"[Chem] loaded {len(z_map)} embeddings (dim={emb_dim}) from allowed list")
         return z_map, emb_dim
 
-    if args.use_chem_emb:
-        z_map, D = load_zmap_from_all(args.chem_embedding_cls_path, args.chem_embedding_meta_path)
+    if use_chem_emb:
+        z_map, D = load_zmap_from_all(
+            _arg_get("chem_embedding_cls_path", "unimol_cls_all_chiral.pt"),
+            _arg_get("chem_embedding_meta_path", "unimol_cls_all_chiral_meta.json"),
+        )
         W = build_W_from_dict(tokenizer, z_map=z_map, emb_dim=D)
     else:
         D = 512
@@ -493,6 +500,7 @@ def run_inference(
     ncaa_bias=1.0,
     ncaa_alpha_max=0.5,
     ncaa_min_prob=1e-3,
+    banned_residues=None,
 ):
     """
     auto regression sampling
@@ -506,12 +514,13 @@ def run_inference(
       - design_mask_b: List[bool]  (length = Lb)
       - meta
     """
-    unk_idx = None
+    banned_idx = []
     if hasattr(tokenizer, "vocab"):
+        banned_set = set(str(r).upper() for r in (banned_residues or []))
+        banned_set.add("UNK")
         for i, t in enumerate(tokenizer.vocab):
-            if str(t).upper() == "UNK":
-                unk_idx = i
-                break
+            if str(t).upper() in banned_set:
+                banned_idx.append(i)
 
     model.eval()
     device = next(model.parameters()).device
@@ -519,7 +528,7 @@ def run_inference(
         graph, device, tokenizer
     )
 
-    # design chain B 
+    # design chain (masked chain in input)
     design_mask = ((mask > 0.5) & (chain_M > 0.5)).bool()  # [B,L]
     dmask = design_mask[0].detach().cpu()                  # [L] bool
     idx_b = torch.nonzero(dmask, as_tuple=False).flatten().tolist()
@@ -543,7 +552,7 @@ def run_inference(
                 residue_idx,
                 chain_encoding_all,
                 temperature=float(temperature),
-                banned_idx=unk_idx,
+                banned_idx=banned_idx,
             )
             S_sample = sample_dict["S"][0].detach().cpu()            # [L]
             chosen_logp = sample_dict["chosen_logp"][0].detach().cpu()  # [L]
@@ -610,7 +619,7 @@ def write_token_sequences_txt(out, out_txt):
 
 def main():
     ap = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument("--ckpt", default='best.pt' help="Path to trained checkpoint")
+    ap.add_argument("--ckpt", default='best.pt', help="Path to trained checkpoint")
     ap.add_argument("--graph", required=False, help="Protein graph (.pt): raw dict or featurized tensors")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--temperature", type=float, default=1.0, help="Softmax temperature (<=1 is sharper)")
@@ -619,6 +628,12 @@ def main():
     ap.add_argument("--p", type=float, default=0.0, help="Nucleus sampling threshold (0=disabled)")
     ap.add_argument("--seed", type=int, default=0, help="Random seed (0=auto)")
     ap.add_argument("--canonical_only", action="store_true", help="Restrict sampling to canonical 20 AAs")
+    ap.add_argument(
+        "--ban_residues",
+        type=str,
+        default="GLY",
+        help="Comma-separated 3-letter residues to ban during sampling (e.g., GLY,CYS).",
+    )
 
     ap.add_argument("--ncaa_ratio_target", type=float, default=0.2, help="Target fraction of ncAA among designed positions (0~1).")
     ap.add_argument("--ncaa_bias", type=float, default=2.0, help="Bias strength to tilt probability mass toward ncAA.")
@@ -643,6 +658,7 @@ def main():
     device = torch.device(args.device)
     if args.seed:
         torch.manual_seed(args.seed)
+    banned_residues = [x.strip().upper() for x in str(args.ban_residues).split(",") if x.strip()]
 
     # Load checkpoint and rebuild model+tokenizer
     ckpt_args, ckpt_vocab, state = load_checkpoint(args.ckpt)
@@ -665,21 +681,25 @@ def main():
     # Determine whether model outputs logits or log-probs
     outputs_are_logits = bool(ckpt_args.get("outputs_are_logits", True))
 
-    # Run inference (B chain only)
+    # Run inference (designed chain only)
     out = run_inference(
         model, tokenizer, graph_obj,
         temperature=args.temperature, topk=args.topk, num_samples=args.num_samples,
         nucleus_p=args.p, canonical_only=args.canonical_only, outputs_are_logits=outputs_are_logits,
         ncaa_ratio_target=args.ncaa_ratio_target, ncaa_bias=args.ncaa_bias,
         ncaa_alpha_max=args.ncaa_alpha_max, ncaa_min_prob=args.ncaa_min_prob,
+        banned_residues=banned_residues,
     )
 
-    # FASTA: B chain only
+    # FASTA: designed chain only
     base = os.path.basename(args.graph) if args.mode == "single" else os.path.basename(args.design)
+    designed_chain = "?"
+    if isinstance(out.get("meta", {}).get("masked_list", None), list) and len(out["meta"]["masked_list"]) > 0:
+        designed_chain = str(out["meta"]["masked_list"][0])
     first = out['samples_b'][0]
     write_fasta(
         args.out_fasta,
-        title=f"{base}|B|sample=1",
+        title=f"{base}|{designed_chain}|sample=1",
         aa1_string=first['aa1_string'],
         design_mask=[True] * len(first['aa1_string'])  
     )
@@ -687,9 +707,9 @@ def main():
         for i, s in enumerate(out['samples_b']):
             score = s.get("score", None)
             if score is not None:
-                _ap.write(f">{base}|B|sample={i+1}|score={score:.4f}\n")
+                _ap.write(f">{base}|{designed_chain}|sample={i+1}|score={score:.4f}\n")
             else:
-                _ap.write(f">{base}|B|sample={i+1}\n")
+                _ap.write(f">{base}|{designed_chain}|sample={i+1}\n")
             seq = s['aa1_string']
             for j in range(0, len(seq), 80):
                 _ap.write(seq[j:j+80] + "\n")
@@ -698,7 +718,7 @@ def main():
     with open(args.out_jsonl, 'w') as fj:
         json.dump(out, fj, indent=2, ensure_ascii=False)
 
-    print(f"[OK] Wrote {args.out_fasta} and pretty JSON at {args.out_jsonl} (B chain only)")
+    print(f"[OK] Wrote {args.out_fasta} and pretty JSON at {args.out_jsonl} (designed chain: {designed_chain})")
 
     write_token_sequences_txt(out, args.out_txt)
     print(f"[OK] Wrote token sequence txt at {args.out_txt}")
