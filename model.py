@@ -630,7 +630,7 @@ class ProteinMPNN(nn.Module):
         residue_idx,
         chain_encoding_all,
         temperature: float = 1.0,
-        banned_idx: int | None = None,
+        banned_idx: int | list[int] | torch.Tensor | None = None,
     ):
         """
         Autoregressive sampling
@@ -690,6 +690,18 @@ class ProteinMPNN(nn.Module):
         h_S = torch.zeros_like(h_V, device=device)          # [B,L,H]
         S = torch.zeros((B, L), dtype=torch.long, device=device)  # final generated sequence
         chosen_logp = torch.zeros((B, L), dtype=torch.float32, device=device)
+
+        banned_tensor = None
+        if banned_idx is not None:
+            if isinstance(banned_idx, torch.Tensor):
+                banned_tensor = banned_idx.to(device=device, dtype=torch.long).view(-1)
+            elif isinstance(banned_idx, (list, tuple, set)):
+                banned_tensor = torch.tensor(list(banned_idx), dtype=torch.long, device=device)
+            else:
+                banned_tensor = torch.tensor([int(banned_idx)], dtype=torch.long, device=device)
+            banned_tensor = banned_tensor[(banned_tensor >= 0) & (banned_tensor < self.vocab)]
+            if banned_tensor.numel() == 0:
+                banned_tensor = None
 
         # encoder features for decoder
         h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
@@ -758,12 +770,22 @@ class ProteinMPNN(nn.Module):
                     t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
                 )[:, 0, :]  # [B,H]
                 logits = self.compute_logits(h_V_t) / float(max(1e-6, temperature))  # [B,V]
+
+                if banned_tensor is not None:
+                    logits[:, banned_tensor] = -1e9
+
                 probs = F.softmax(logits, dim=-1)  # [B,V]
-                
-                # ban unk
-                if banned_idx is not None:
-                    probs[:, banned_idx] = 0.0
-                    probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-12)
+
+                if banned_tensor is not None:
+                    row_sum = probs.sum(dim=-1, keepdim=True)
+                    zero_rows = (row_sum <= 1e-12).squeeze(-1)
+                    if zero_rows.any():
+                        fallback = torch.ones((int(zero_rows.sum().item()), probs.shape[1]), device=device, dtype=probs.dtype)
+                        fallback[:, banned_tensor] = 0.0
+                        fallback = fallback / (fallback.sum(dim=-1, keepdim=True) + 1e-12)
+                        probs[zero_rows] = fallback
+                        row_sum = probs.sum(dim=-1, keepdim=True)
+                    probs = probs / (row_sum + 1e-12)
                 S_t = torch.multinomial(probs, 1)  # [B,1]
 
                 # log p（only for design location）
